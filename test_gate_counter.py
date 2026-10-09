@@ -89,6 +89,124 @@ def test_portal_vanish_while_standing_no_count():
     assert run(c, {1: p}, frames=100) == []
 
 
+def test_portal_stay_then_vanish():
+    c = GateCounter(portal_cfg("outside"))
+    p = walk((320, 450), (320, 200), 40) + [(320, 200)] * 90      # walk in, stay ~3 s, then lost
+    ev = run(c, {1: p}, frames=200)
+    print("stay then vanish", types(ev))
+    assert types(ev) == [("OUT", 1)]
+
+
+def test_portal_edge_jitter_then_lost_no_count():
+    c = GateCounter(portal_cfg("outside"))
+    p = [(320, 300)] * 60 + jitter([(320, 255)] * 10, 6)          # standing at the portal edge, lost
+    assert run(c, {1: p}, frames=150) == []
+
+
+# ---- slow / lingering disappearance must still count (no time or speed condition)
+def test_portal_slow_vanish():
+    c = GateCounter(portal_cfg("outside"))
+    p = walk((320, 450), (320, 240), 40) + walk((320, 240), (320, 232), 90)   # creeps for 3 s, then lost
+    ev = run(c, {1: p}, frames=200)
+    print("slow vanish", types(ev))
+    assert types(ev) == [("OUT", 1)]
+
+
+def test_portal_stand_then_vanish():
+    c = GateCounter(portal_cfg("inside"))
+    p = walk((320, 450), (320, 240), 40) + [(320, 240)] * 120               # stands still 4 s, then lost
+    assert types(run(c, {1: p}, frames=260)) == [("IN", 1)]
+
+
+# ---- far_percent: person visible but small inside the portal => hidden side
+def far_cfg(leads, pct=50):
+    cfg = portal_cfg(leads)
+    cfg.region.zones[0].far_percent = pct
+    return cfg
+
+
+def shrink_path(h_end=40):
+    a = [(x, y, 200) for x, y in walk((320, 450), (320, 240), 30)]
+    b = [(320, 240 - i * 0.5, 200 - (200 - h_end) * i / 39) for i in range(40)]   # walks away, shrinks
+    return a + b
+
+
+def test_far_percent_camera_inside():
+    c = GateCounter(far_cfg("outside", 50))                      # area metric: far below 50% of the portal rect
+    ev = run(c, {1: shrink_path()}, frames=70)                   # person stays visible to the end
+    print("far inside-cam", types(ev))
+    assert types(ev) == [("OUT", 1)]
+
+
+def test_far_percent_height_metric():
+    cfg = far_cfg("outside", 50)
+    cfg.region.zones[0].far_metric = "height"                    # rect h=150 -> far below 75 px
+    c = GateCounter(cfg)
+    assert types(run(c, {1: shrink_path()}, frames=70)) == [("OUT", 1)]
+
+
+def test_far_percent_area_threshold():
+    # portal rect 140x150=21000. Person box (0.4h x h) area 0.4h^2: 15% -> far when h < 88
+    cfg = far_cfg("outside", 15)
+    c = GateCounter(cfg)
+    ev = run(c, {1: shrink_path(h_end=120)}, frames=70)         # only shrinks to 120 px -> never "far"
+    assert ev == []
+    c = GateCounter(far_cfg("outside", 15))
+    assert types(run(c, {1: shrink_path(h_end=60)}, frames=70)) == [("OUT", 1)]
+
+
+def test_far_percent_camera_outside():
+    c = GateCounter(far_cfg("inside", 50))
+    assert types(run(c, {1: shrink_path()}, frames=70)) == [("IN", 1)]
+
+
+def test_far_percent_off_no_event():
+    c = GateCounter(far_cfg("outside", 0))
+    assert run(c, {1: shrink_path()}, frames=70) == []           # still visible, feature off
+
+
+def test_far_then_return():
+    c = GateCounter(far_cfg("outside", 50))
+    back = [(320, 240 - 19.5 + i * 0.5, 40 + 160 * i / 39) for i in range(40)]
+    p = shrink_path() + back + [(x, y, 200) for x, y in walk((320, 240), (320, 450), 40)]
+    ev = run(c, {1: p}, frames=160)
+    print("far then return", types(ev))
+    assert types(ev) == [("OUT", 1), ("IN", 1)]
+
+
+# ---- per-gate reference point
+def test_per_line_ref_point():
+    # person (h=200) walks up through a horizontal line at y=300: the box CENTER crosses ~100 px before the feet
+    def first_event_frame(ref):
+        c = GateCounter(CounterConfig(lines=[LineGate("L", (0, 300), (640, 300), "left", ref_point=ref)]))
+        ev = run(c, {1: walk((320, 700), (320, 100), 120)})
+        assert len(ev) == 1, ev
+        return ev[0].frame
+    f_feet, f_center, f_top = first_event_frame(None), first_event_frame("center"), first_event_frame("top_center")
+    print("ref frames feet/center/top", f_feet, f_center, f_top)
+    assert f_top < f_center < f_feet          # walking up: the higher bbox point reaches the line first
+
+
+def test_per_zone_ref_point():
+    def cfg(ref):
+        z = Zone("door", "portal", [(250, 100), (390, 100), (390, 250), (250, 250)], "outside", ref_point=ref)
+        return CounterConfig(region=RegionConfig(zones=[z], portal_use_box_center=False))
+    p = walk((320, 500), (320, 300), 50)             # feet stop at y=300 (below the portal), center reaches y=200 (inside)
+    assert run(GateCounter(cfg(None)), {1: p}, frames=120) == []                      # feet never enter
+    assert types(run(GateCounter(cfg("center")), {1: p}, frames=120)) == [("OUT", 1)]  # center does
+
+
+def test_ref_point_names():
+    from gate_counter import reference_point
+    b = (100, 100, 140, 300)
+    assert reference_point(b, "bottom_center") == (120, 300) and reference_point(b, "left") == (100, 200)
+    assert reference_point(b, "top_right") == (140, 100)
+    try:
+        reference_point(b, "nope"); assert False
+    except ValueError:
+        pass
+
+
 # ---- outside visible zone + default inside
 def test_outside_zone():
     cfg = CounterConfig(region=RegionConfig(zones=[Zone("street", "outside",

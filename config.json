@@ -2,40 +2,51 @@
   "source": "0",
   "model": "yolov8n.pt",
   "tracker": "bytetrack.yaml",
-  "conf": 0.35,
+  "conf": 0.1,
   "iou": 0.5,
   "imgsz": 640,
   "device": null,
   "display_scale": 1.0,
   "realtime_playback": true,
+  "fullscreen": false,
   "counter": {
-    "lines": [
-      {
-        "id": "line1",
-        "p0": [
-          0.44219,
-          0.3
-        ],
-        "p1": [
-          0.43906,
-          0.8875
-        ],
-        "in_side": "right",
-        "margin_px": 8.0,
-        "margin_bbox_ratio": 0.08,
-        "extend": 0.15
-      }
-    ],
+    "lines": [],
     "region": {
-      "zones": [],
+      "zones": [
+        {
+          "id": "portal1",
+          "kind": "portal",
+          "polygon": [
+            [
+              0.61719,
+              0.13333
+            ],
+            [
+              0.27656,
+              0.13958
+            ],
+            [
+              0.29688,
+              0.93125
+            ],
+            [
+              0.6375,
+              0.90208
+            ]
+          ],
+          "leads_to": "outside",
+          "far_percent": 0.0,
+          "far_metric": "area"
+        }
+      ],
       "default_side": "auto",
       "min_dwell_frames": 3,
       "commit_lost_frames": 8,
-      "vanish_lookback_frames": 30,
+      "portal_use_box_center": true,
       "min_travel_px": 30,
       "min_travel_bbox_ratio": 0.35
     },
-    "ref_point": "center",
+    "ref_point": "bottom_center",
     "smooth_window": 5,
     "track_timeout_frames": 30,
     "max_history": 300

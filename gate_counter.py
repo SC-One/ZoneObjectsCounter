@@ -18,9 +18,16 @@ Two independent gate types (use either, or both, any number of lines):
                (auto: the opposite of what the portal leads to).
    Each track has a `side`. It changes (=> event) when the track:
      - leaves a portal into a visible area on the other side than the portal leads to,
-     - walks into a portal and VANISHES there (side != portal.leads_to),
+     - walks into a portal and VANISHES there (side != portal.leads_to). No speed / time condition:
+       visible = still on its side, gone from inside a portal = went to the hidden side,
+     - becomes "far" inside a portal that has `far_percent` set: the person's bbox is smaller than
+       that % of the portal rectangle (area by default, or height), i.e. far from the camera =
+       beyond the gate, so it is already on the hidden side even though still visible,
      - moves from an inside zone to an outside zone (or back).
 No global direction vector is used, so it is independent of camera angle / perspective.
+
+Reference point: every line / zone may set its own `ref_point` (which point of the person's bbox is
+tested against it, see REF_POINTS); if not set, the global `CounterConfig.ref_point` is used.
 """
 from __future__ import annotations
 
@@ -44,6 +51,7 @@ class LineGate:
     margin_px: float = 8.0           # dead-band half-width ...
     margin_bbox_ratio: float = 0.08  # ... = max(px, ratio * bbox height)  (perspective-aware)
     extend: float = 0.15             # crossing accepted this fraction beyond the segment ends
+    ref_point: Optional[str] = None  # bbox point tested against this line (None = global ref_point)
 
 
 @dataclass
@@ -52,6 +60,10 @@ class Zone:
     kind: str                        # "portal" | "inside" | "outside"
     polygon: List[Point]
     leads_to: str = OUTSIDE          # portal only: hidden side behind it
+    far_percent: float = 0.0         # portal only, 0 = off: person inside the portal whose bbox is smaller
+                                     # than this % of the portal rectangle is on the hidden side
+    far_metric: str = "area"         # "area" (bbox area / portal bounding-rect area) | "height"
+    ref_point: Optional[str] = None  # bbox point tested against this zone (None = global ref_point)
 
 
 @dataclass
@@ -60,8 +72,8 @@ class RegionConfig:
     default_side: str = "auto"       # "auto" | "inside" | "outside": meaning of unmarked area
     min_dwell_frames: int = 3        # frames in a region before it counts as the track's region
     commit_lost_frames: int = 8      # lost this long while in a portal => vanished into it
-    vanish_lookback_frames: int = 30 # window used to check the track was really moving
-    min_travel_px: float = 30.0      # min movement to accept a transition ...
+    portal_use_box_center: bool = True   # portal also matches when the bbox CENTER is inside (partial/occluded bodies)
+    min_travel_px: float = 30.0      # min movement to accept a visible->visible transition ...
     min_travel_bbox_ratio: float = 0.35  # ... = max(px, ratio * bbox height)
 
 
@@ -69,7 +81,7 @@ class RegionConfig:
 class CounterConfig:
     lines: List[LineGate] = field(default_factory=list)
     region: RegionConfig = field(default_factory=RegionConfig)
-    ref_point: str = "bottom_center"     # "bottom_center" (feet) | "center"
+    ref_point: str = "bottom_center"     # default bbox point, see REF_POINTS (bottom_center = feet)
     smooth_window: int = 5
     track_timeout_frames: int = 30
     max_history: int = 300
@@ -110,19 +122,25 @@ class LineState:
 @dataclass
 class TrackState:
     track_id: int
-    raw: Deque[Point]
-    trail: Deque[Point]                                   # smoothed history (for display)
+    trail: Deque[Point]                                   # smoothed history of the GLOBAL ref point
+    raws: Dict[str, Deque[Point]] = field(default_factory=dict)   # per ref name: recent raw points
+    pts: Dict[str, Point] = field(default_factory=dict)           # per ref name: smoothed current point
     heights: Deque[float] = field(default_factory=lambda: deque(maxlen=30))
     last_frame: int = -1
+    sm_w: float = 0.0                                     # smoothed bbox size
+    sm_h: float = 0.0
+    size_ratio: Optional[float] = None                    # person size / portal rect size (debug)
     lines: Dict[str, LineState] = field(default_factory=dict)
     # region model
-    reg_raw: Optional[Tuple[str, str]] = None
+    reg_raw: Optional[Tuple[str, str, bool]] = None
     reg_run: int = 0
     reg_stable: Optional[str] = None
     stable_leads: str = OUTSIDE
+    stable_far: bool = False
     last_reg: Optional[str] = None
     last_leads: str = OUTSIDE
     portal_id: str = "region"
+    center: Optional[Point] = None                        # raw bbox center of the last box
     side: Optional[str] = None                            # inside/outside, None = unknown
     side_pt: Optional[Point] = None
     vanish_checked: bool = False
@@ -143,10 +161,22 @@ def point_in_polygon(p: Point, poly: Sequence[Point]) -> bool:
     return inside
 
 
+REF_POINTS = {                    # name -> (fx, fy): fraction of bbox width / height from the top-left
+    "bottom_center": (0.5, 1.0), "center": (0.5, 0.5), "top_center": (0.5, 0.0),
+    "left_center": (0.0, 0.5), "right_center": (1.0, 0.5),
+    "bottom_left": (0.0, 1.0), "bottom_right": (1.0, 1.0),
+    "top_left": (0.0, 0.0), "top_right": (1.0, 0.0),
+}
+_REF_ALIASES = {"bottom": "bottom_center", "top": "top_center", "left": "left_center", "right": "right_center"}
+
+
 def reference_point(box: BBox, mode: str) -> Point:
+    name = _REF_ALIASES.get(mode, mode)
+    if name not in REF_POINTS:
+        raise ValueError(f"unknown ref_point {mode!r}, use one of {sorted(REF_POINTS)}")
+    fx, fy = REF_POINTS[name]
     x1, y1, x2, y2 = box
-    cx = 0.5 * (x1 + x2)
-    return (cx, y2) if mode == "bottom_center" else (cx, 0.5 * (y1 + y2))
+    return (x1 + fx * (x2 - x1), y1 + fy * (y2 - y1))
 
 
 def _median(v: Sequence[float]) -> float:
@@ -191,13 +221,12 @@ class GateCounter:
             seen.add(tid)
             st = self.tracks.get(tid)
             if st is None:
-                st = self.tracks[tid] = TrackState(
-                    tid, raw=deque(maxlen=cfg.smooth_window), trail=deque(maxlen=cfg.max_history))
+                st = self.tracks[tid] = TrackState(tid, trail=deque(maxlen=cfg.max_history))
             self._push(st, frame_idx, box)
             st.vanish_checked = False
             cur, h = st.trail[-1], _median(st.heights)
             for lg in cfg.lines:
-                t = self._line_step(st, lg, cur, h)
+                t = self._line_step(st, lg, st.pts[lg.ref_point or cfg.ref_point], h)
                 if t:
                     events.append(self._emit(st, t, lg.id, frame_idx, cur))
             if rc.zones:
@@ -209,7 +238,7 @@ class GateCounter:
             if tid in seen:
                 continue
             missed = frame_idx - st.last_frame
-            if rc.zones and not st.vanish_checked and missed >= rc.commit_lost_frames:
+            if rc.zones and not st.vanish_checked and missed >= min(rc.commit_lost_frames, cfg.track_timeout_frames):
                 st.vanish_checked = True
                 t = self._vanish(st)
                 if t:
@@ -233,25 +262,54 @@ class GateCounter:
                 return _opp(z.leads_to)
         return INSIDE
 
-    def classify(self, pt: Point) -> Tuple[str, str, str]:
-        """-> (region 'portal'|'inside'|'outside', leads_to, zone_id)"""
+    def classify(self, pts: Dict[str, Point], center: Optional[Point] = None,
+                 size: Optional[Tuple[float, float]] = None) -> Tuple[str, str, str, bool, Optional[float]]:
+        """-> (region 'portal'|'inside'|'outside', leads_to, zone_id, far, size_ratio)
+        `pts` = smoothed person point per ref name (each zone uses its own ref_point or the global one).
+        `center` = extra point tested for portals. `size` = (bbox w, h): if the portal has far_percent
+        and the person is smaller than that, the region is the portal's hidden side (far=True)."""
         zs = self.cfg.region.zones
         for z in zs:
-            if z.kind == PORTAL and point_in_polygon(pt, z.polygon):
-                return PORTAL, z.leads_to, z.id
+            if z.kind == PORTAL and (point_in_polygon(pts[z.ref_point or self.cfg.ref_point], z.polygon)
+                                     or (center is not None and point_in_polygon(center, z.polygon))):
+                xs = [p[0] for p in z.polygon]
+                ys = [p[1] for p in z.polygon]
+                rect_w, rect_h = max(xs) - min(xs), max(ys) - min(ys)
+                ratio = None
+                if size is not None and rect_w > 1e-6 and rect_h > 1e-6:
+                    ratio = (size[1] / rect_h) if z.far_metric == "height" \
+                        else (size[0] * size[1]) / (rect_w * rect_h)
+                if z.far_percent > 0 and ratio is not None and ratio < z.far_percent / 100.0:
+                    return z.leads_to, z.leads_to, z.id, True, ratio
+                return PORTAL, z.leads_to, z.id, False, ratio
         for z in zs:
-            if z.kind in (INSIDE, OUTSIDE) and point_in_polygon(pt, z.polygon):
-                return z.kind, z.kind, z.id
+            if z.kind in (INSIDE, OUTSIDE) and point_in_polygon(pts[z.ref_point or self.cfg.ref_point], z.polygon):
+                return z.kind, z.kind, z.id, False, None
         d = self.default_side()
-        return d, d, "region"
+        return d, d, "region", False, None
 
     # ------------------------------------------------------------ internals
     def _push(self, st: TrackState, frame_idx: int, box: BBox) -> None:
         st.last_frame = frame_idx
-        st.heights.append(max(1.0, box[3] - box[1]))
-        st.raw.append(reference_point(box, self.cfg.ref_point))
-        n = len(st.raw)
-        st.trail.append((sum(p[0] for p in st.raw) / n, sum(p[1] for p in st.raw) / n))
+        w, h = max(1.0, box[2] - box[0]), max(1.0, box[3] - box[1])
+        st.sm_w, st.sm_h = (w, h) if st.sm_h == 0.0 else (0.6 * st.sm_w + 0.4 * w, 0.6 * st.sm_h + 0.4 * h)
+        st.heights.append(h)
+        st.center = (0.5 * (box[0] + box[2]), 0.5 * (box[1] + box[3]))
+        for name in self._ref_names():                # one smoothed point per ref name in use
+            dq = st.raws.get(name)
+            if dq is None:
+                dq = st.raws[name] = deque(maxlen=self.cfg.smooth_window)
+            dq.append(reference_point(box, name))
+            n = len(dq)
+            st.pts[name] = (sum(p[0] for p in dq) / n, sum(p[1] for p in dq) / n)
+        st.trail.append(st.pts[self.cfg.ref_point])
+
+    def _ref_names(self) -> set:
+        cfg = self.cfg
+        names = {cfg.ref_point}
+        names.update(l.ref_point for l in cfg.lines if l.ref_point)
+        names.update(z.ref_point for z in cfg.region.zones if z.ref_point)
+        return names
 
     def _emit(self, st: TrackState, etype: str, gate_id: str, frame_idx: int, pt: Point) -> GateEvent:
         if etype == "IN":
@@ -294,19 +352,21 @@ class GateCounter:
     # ---- region model
     def _region_step(self, st: TrackState, cur: Point, h: float) -> Optional[str]:
         rc = self.cfg.region
-        reg, leads, zid = self.classify(cur)
-        if reg == PORTAL:
+        reg, leads, zid, far, ratio = self.classify(
+            st.pts, st.center if rc.portal_use_box_center else None, (st.sm_w, st.sm_h))
+        st.size_ratio = ratio
+        if reg == PORTAL or far:
             st.portal_id = zid
-            if st.reg_raw is None:                    # first seen inside a portal => came from hidden side
-                st.side, st.side_pt = leads, cur
+        if reg == PORTAL and st.reg_raw is None:      # first seen inside a portal => came from hidden side
+            st.side, st.side_pt = leads, cur
         st.last_reg, st.last_leads = reg, leads
-        key = (reg, leads)
+        key = (reg, leads, far)
         if key == st.reg_raw:
             st.reg_run += 1
         else:
             st.reg_raw, st.reg_run = key, 1
         if st.reg_run >= rc.min_dwell_frames:
-            st.reg_stable, st.stable_leads = reg, leads
+            st.reg_stable, st.stable_leads, st.stable_far = reg, leads, far
         S = st.reg_stable
         if S is None:
             return None
@@ -317,17 +377,18 @@ class GateCounter:
         if st.side is None or S == st.side:
             st.side, st.side_pt = S, cur
             return None
-        if _dist(cur, st.side_pt) >= self._thr(h, rc.min_travel_px, rc.min_travel_bbox_ratio):
+        # "far" inside a portal is decided by size (walking away from the camera moves few pixels);
+        # visible -> visible transitions need real travel
+        if st.stable_far or _dist(cur, st.side_pt) >= self._thr(h, rc.min_travel_px, rc.min_travel_bbox_ratio):
             st.side, st.side_pt = S, cur
             return "IN" if S == INSIDE else "OUT"
         return None
 
     def _vanish(self, st: TrackState) -> Optional[str]:
-        rc = self.cfg.region
+        """Called once the track has been absent `commit_lost_frames` frames (only a debounce against
+        1-2 frame detector dropouts). No condition on speed or on how long the person was there:
+        last seen inside a portal and known side != hidden side  =>  went to the hidden side."""
         if st.last_reg != PORTAL or st.side is None or st.side == st.last_leads:
             return None
-        pts = list(st.trail)[-rc.vanish_lookback_frames:]
-        if _dist(pts[0], pts[-1]) < self._thr(_median(st.heights), rc.min_travel_px, rc.min_travel_bbox_ratio):
-            return None                               # was not really walking into the portal
         st.side, st.side_pt = st.last_leads, st.trail[-1]
         return "OUT" if st.last_leads == OUTSIDE else "IN"

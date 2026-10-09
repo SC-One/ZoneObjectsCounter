@@ -8,7 +8,8 @@ Gates (draw any time, video freezes on the current frame while drawing):
   o  OUTSIDE zone polygon      i  INSIDE zone polygon      (Enter to finish, Backspace undo)
 Other keys:
   x undo last gate | c clear all gates | f unmarked-area meaning (auto/inside/outside)
-  s save config | r reset counts | space pause | t trails | d debug | h help | q/Esc quit
+  [ ] lower / raise far_percent (0 = off) of the last portal, m = area/height measure; s saves it
+  y cycle the ref point of the last gate (global/bottom/center/top/left/right) | w toggle fullscreen | s save config | r reset counts | space pause | t trails | d debug | h help | q/Esc quit
 """
 import argparse
 import json
@@ -180,8 +181,23 @@ def draw_all(frame, counter, dets, flashes, log, scale, show_trails, show_debug,
         img = cv2.addWeighted(ov, 0.2, img, 0.8, 0)
         cv2.polylines(img, [poly], True, col, 2)
         label = f"PORTAL ({z.id}) -> hidden: {z.leads_to}" if z.kind == "portal" else f"{z.kind.upper()} ({z.id})"
+        if z.ref_point:
+            label += f" ref={z.ref_point}"
         c = poly.mean(axis=0).astype(int)
         cv2.putText(img, label, (int(c[0]) - 60, int(c[1])), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 2)
+        if z.kind == "portal" and z.far_percent > 0:
+            # reference box: a person smaller than this box (inside the portal) is "far" = hidden side
+            xs = [p[0] for p in z.polygon]
+            ys = [p[1] for p in z.polygon]
+            rw, rh = max(xs) - min(xs), max(ys) - min(ys)
+            if z.far_metric == "height":
+                th = rh * z.far_percent / 100.0
+            else:
+                th = math.sqrt(rw * rh * z.far_percent / 100.0 / 0.4)    # person box ~ 0.4 x 1 aspect
+            bx, by = max(xs) + 12 / scale, max(ys)
+            cv2.rectangle(img, S((bx, by - th)), S((bx + 0.4 * th, by)), col, 2)
+            cv2.putText(img, f"far < {z.far_percent:g}% ({z.far_metric})", S((bx, by - th - 6 / scale)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 2)
 
     # lines + IN arrow (perpendicular, pointing to the INSIDE side)
     for l in cfg.lines:
@@ -194,7 +210,8 @@ def draw_all(frame, counter, dets, flashes, log, scale, show_trails, show_debug,
         m = ((l.p0[0] + l.p1[0]) / 2, (l.p0[1] + l.p1[1]) / 2)
         tip = (m[0] + nx * 60 / scale, m[1] + ny * 60 / scale)
         cv2.arrowedLine(img, S(m), S(tip), LINE_COLOR, 2, tipLength=0.3)
-        cv2.putText(img, f"{l.id}: IN side", S(tip), cv2.FONT_HERSHEY_SIMPLEX, 0.5, LINE_COLOR, 2)
+        cv2.putText(img, f"{l.id}: IN side" + (f" ref={l.ref_point}" if l.ref_point else ""), S(tip),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, LINE_COLOR, 2)
 
     if show_trails:
         for tid, st in counter.tracks.items():
@@ -208,7 +225,13 @@ def draw_all(frame, counter, dets, flashes, log, scale, show_trails, show_debug,
         label = f"ID {tid}"
         if show_debug and st and st.side:
             label += f" [{st.side}]"
+        if show_debug and st and st.size_ratio is not None:
+            label += f" {int(st.size_ratio * 100)}%"      # person size / portal rect size (far_metric)
         cv2.putText(img, label, (int(x1 * scale), int(y1 * scale) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.55, c, 2)
+        if st:                                        # rings = the ref point of gates that use their own
+            for g, gcol in [(l, LINE_COLOR) for l in cfg.lines] + [(z, KIND_COLOR[z.kind]) for z in cfg.region.zones]:
+                if g.ref_point and g.ref_point != cfg.ref_point and g.ref_point in st.pts:
+                    cv2.circle(img, S(st.pts[g.ref_point]), 7, gcol, 2)
         if st and st.trail:
             dot = KIND_COLOR.get(st.last_reg, (0, 255, 255)) if st.last_reg else (0, 255, 255)
             cv2.circle(img, S(st.trail[-1]), 5, dot, -1)
@@ -238,7 +261,7 @@ def draw_all(frame, counter, dets, flashes, log, scale, show_trails, show_debug,
                     (20, img.shape[0] // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
     if show_help:
         cv2.putText(img, "l line | p portal | o outside zone | i inside zone | x undo | c clear | "
-                         "f default side | s save | r reset | h help",
+                         "f default side | y ref point (last gate) | [ ] far% m metric | w fullscreen | s save | r reset | h help",
                     (8, img.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     return img
 
@@ -278,7 +301,10 @@ def main():
     editor = Editor(scale)
 
     win = "People IN/OUT"
-    cv2.namedWindow(win)
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)            # resizable window (drag its corner)
+    fullscreen = bool(cfg.get("fullscreen", False))
+    if fullscreen:
+        cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     cv2.setMouseCallback(win, editor.on_mouse)
 
     frame, dets, frame_idx = None, [], 0
@@ -332,6 +358,29 @@ def main():
         elif k == ord("c"):
             counter.cfg.lines.clear(); counter.cfg.region.zones.clear(); added.clear()
             counter.reset(); flashes.clear(); log.clear()
+        elif k in (ord("["), ord("]")):
+            portals = [z for z in counter.cfg.region.zones if z.kind == "portal"]
+            if portals:
+                z = portals[-1]
+                z.far_percent = float(min(100, max(0, z.far_percent + (5 if k == ord("]") else -5))))
+                print(f"portal {z.id}: far_percent = {z.far_percent:g}" + ("  (off)" if z.far_percent == 0 else ""))
+        elif k == ord("y") and added:
+            g = added[-1][1]                          # last gate: cycle its own ref point
+            order = [None, "bottom_center", "center", "top_center", "left_center", "right_center"]
+            i = order.index(g.ref_point) if g.ref_point in order else -1
+            g.ref_point = order[(i + 1) % len(order)]
+            print(f"{g.id}: ref_point = {g.ref_point or 'global (' + counter.cfg.ref_point + ')'}")
+            counter.reset(); flashes.clear(); log.clear()
+        elif k == ord("w"):
+            fullscreen = not fullscreen
+            cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN,
+                                  cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL)
+        elif k == ord("m"):
+            portals = [z for z in counter.cfg.region.zones if z.kind == "portal"]
+            if portals:
+                z = portals[-1]
+                z.far_metric = "height" if z.far_metric == "area" else "area"
+                print(f"portal {z.id}: far_metric = {z.far_metric}")
         elif k == ord("f"):
             rc = counter.cfg.region
             rc.default_side = {"auto": "inside", "inside": "outside", "outside": "auto"}[rc.default_side]
