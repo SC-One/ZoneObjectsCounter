@@ -1,241 +1,172 @@
-# Gate IN/OUT People Counter
+# People IN/OUT Counter (any camera angle)
 
-Counts people **entering (IN)** and **leaving (OUT)** through a gate, from a camera or a video file.
-It has a debug GUI so you can *see* what the algorithm is doing.
+Counts people **entering (IN)** and **leaving (OUT)** from a camera or video file, with a debug GUI.
+v2: the old "one polygon + one direction arrow" design was replaced, because a single image-space
+direction does not hold for corridors, perspective, door-facing cameras or people who vanish into a door.
 
----
-
-## 1. Big picture
+## 1. How it works now
 
 ```
- camera / video ──► YOLO (finds people) ──► ByteTrack (gives each person an ID)
-                                                   │
-                                   [(track_id, bbox), ...] per frame
-                                                   ▼
-                                       GateCounter   (gate_counter.py)
-                                       pure logic, no AI libraries
-                                                   │
-                                          IN / OUT events + counts
-                                                   ▼
-                                           GUI (main.py) draws everything
+camera/video ─► YOLO + ByteTrack ─► [(track_id, bbox)] ─► GateCounter (gate_counter.py, pure Python) ─► IN/OUT events
+                (main.py only)                                       ▲
+                                                 gates drawn in the GUI: lines, portals, zones
 ```
 
-| File | Role |
-|---|---|
-| `gate_counter.py` | **The module.** IN/OUT logic only. Standard library only. Knows nothing about YOLO, ByteTrack or OpenCV. |
-| `main.py` | The application: opens camera/video, runs YOLO+ByteTrack, feeds `GateCounter`, shows the GUI. |
-| `config.json` | All settings for one camera (source, model, gate, thresholds). |
-| `CONFIG.md` | Short key-by-key reference of `config.json`. |
+The counter never uses a global direction. It uses **topology**: which *side* of a line a person is on, or
+which *region* (inside / outside / portal) they came from and went to. That is independent of camera angle.
 
----
+| Gate type | Idea | Use when |
+|---|---|---|
+| **Line** | A virtual line on the floor. Crossing it flips the person's side. You also mark which side is INSIDE. | You can see both sides of the passage. |
+| **Portal** (commit zone) | A polygon where people **appear / vanish** (a door seen head-on, a corridor mouth). You say what is hidden behind it: `outside` or `inside`. Walk in and vanish = went to the hidden side. Appear there and walk away = came from the hidden side. | You cannot see the other side. |
+| **Inside / Outside zone** | Optional visible areas. Moving from one to the other = IN or OUT. Anything unmarked = `default_side`. | You can see outside (glass door, lobby, street). |
 
-## 2. Install and run
+You can combine any number of lines and zones in one camera (a room with several entrances).
+Use **one gate per physical door**, otherwise one real crossing can be reported twice.
+
+## 2. Quick start
 
 ```bash
-pip install -r requirements.txt          # ultralytics, opencv-python, numpy
-
-python main.py --source 0                # webcam 0
-python main.py --source video.mp4        # video file
-python main.py --config room2.json       # use another config file
+pip install -r requirements.txt            # ultralytics, opencv-python, numpy
+python main.py --source 0                  # webcam
+python main.py --source video.mp4          # file
+python main.py --source rtsp://...         # IP camera
+python main.py --config room2.json         # another camera's config
+python test_gate_counter.py                # synthetic tests of the logic (no camera needed)
 ```
 
-The first run downloads `yolov8n.pt` automatically.
+First run: no gates exist (the GUI says so). Press a key below to draw one, then `s` to save.
 
----
+## 3. Which gate for which camera?
 
-## 3. What you see in the GUI
-
-| What | Meaning |
+| Camera situation | Use |
 |---|---|
-| **Yellow/orange transparent polygon** | The **Gate** (the zone). It is *your* polygon. |
-| **Magenta arrow labeled `IN`** | The **IN direction**. Walking along this arrow = IN. Walking against it = OUT. |
-| **Colored box + `ID 3 STATE`** | A tracked person and their ID. Each ID has its own color. |
-| **Colored line behind a person** | Their trajectory (trail). |
-| **Small dot on the person's feet** | The point used for the logic. **Green** = inside the gate, **red** = outside. |
-| **`IN #3` / `OUT #5` large text** | An event, shown for about 1.5 seconds where it happened. |
-| **Top-left panel** | Total `IN` / `OUT` counts and the last events. |
-| `STATE` in the label | `IDLE` (outside, waiting), `IN_GATE` (inside, being evaluated), `COUNTED` (already counted, locked). |
+| **Corridor**, camera looking along it | **Line** across the corridor on the floor, mark the room side as INSIDE |
+| **Side-on / orthogonal** to the door (you see people pass the threshold) | **Line** along the door threshold on the floor |
+| **Head-on, inside the room** looking at the door (people vanish into / appear from it) | **Portal** around the door, hidden = `outside` |
+| **Head-on, outside** looking at the door | **Portal** around the door, hidden = `inside` |
+| **Overhead** camera | Line on the threshold (or a portal) |
+| You can **see outside** through the door | Line, or an **Outside zone** polygon (+ optional portal) |
+| Only **inside** is visible, no clear door | Portal where people appear/disappear |
+| **Several entrances** in one view | One line/portal per entrance |
 
-### "Why is there a rectangle? I want my own polygon!"
+Guidelines: lines are most precise when feet cross them. Portals depend on the tracker losing/finding people at the door,
+so draw them tightly around the door, not over the whole room.
 
-That rectangle is **only the default placeholder** from `config.json`
-(the 4 points `[0.25,0.3] [0.75,0.3] [0.75,0.8] [0.25,0.8]`).
-It is not special. Replace it any time:
+## 4. Drawing gates in the GUI (any time)
 
-1. Press **`g`** (the video freezes on the current frame).
-2. Click the points of your polygon on the image (as many as you want, at least 3).
-   `Backspace` removes the last point.
-3. Press **`Enter`** to close the polygon.
-4. Click **two points** for the direction arrow: **start**, then **end**
-   (or press `Enter` to keep the existing arrow).
-5. Done. Counts reset and the new gate is active.
-6. Press **`s`** to save it into the config file so it is used next time.
-
-`Esc` cancels while editing.
-
-### Keys
+The video freezes on the current frame while you draw. `Esc` cancels.
 
 | Key | Action |
 |---|---|
-| `g` | Draw a new gate polygon + direction |
-| `s` | Save current gate to the config file |
-| `r` | Reset counters |
-| `space` | Pause / resume |
-| `t` | Show/hide trails |
-| `d` | Show/hide state text in labels |
-| `q` / `Esc` | Quit |
+| `l` | **Line**: click start, click end, then click **one point on the INSIDE side**. An arrow marked "IN side" is drawn. |
+| `p` | **Portal**: click polygon points, `Enter`, then `O` (hidden side = outside) or `I` (hidden = inside) |
+| `o` | **Outside zone** polygon (`Enter` to finish) |
+| `i` | **Inside zone** polygon (`Enter` to finish) |
+| `Backspace` | undo last point while drawing |
+| `x` / `c` | delete last gate / clear all gates |
+| `f` | cycle the meaning of the unmarked area: `auto` → `inside` → `outside` |
+| `s` | **save** to the config file |
+| `r` | reset counters |
+| `space`, `t`, `d`, `h`, `q` | pause, trails, debug labels, help line, quit |
 
----
+Adding or deleting a gate resets counts and track states.
 
-## 4. Gate and direction (the most important concept)
+What you see: magenta lines with an `IN side` arrow; orange = portal, green = inside zone, blue = outside zone (labeled);
+colored boxes with `ID n [inside|outside]` (the side the tracker currently believes the person is on);
+a dot on the feet (colored by region); `IN #3` / `OUT #5` flashes; top-left counts and event log with the gate id.
 
-### The Gate (polygon)
-A zone in the image that people walk **through**. Draw it over the doorway / passage, on the **floor area**
-where people's feet pass (the logic follows the *feet*, bottom-center of the box).
+## 5. Logic details
 
-Tips:
-- Make it large enough that a person is inside it for at least a few frames.
-- It can be any shape and any orientation: a tilted rectangle, a trapezoid (perspective), etc.
-- Don't make it so large that it also covers people just standing nearby.
+**Line gate** (per track, per line): signed distance of the (smoothed) feet point to the line. Inside a dead-band
+(`max(margin_px, margin_bbox_ratio * bbox height)`) nothing changes, so jitter can't flip the side. When the side flips,
+the crossing point must lie within the segment (± `extend`), otherwise the person just walked around the line's end.
+Flip toward the `in_side` = IN, otherwise OUT. A person who goes back and forth is counted each real crossing.
 
-### The direction arrow
-An arrow from point A to point B that says: **"walking this way means IN."**
+**Region model** (per track): the track has a `side` (`inside`/`outside`), initialised from where it is first confidently seen
+(or from the portal's hidden side if it first appears inside a portal). It changes, producing an event, when:
+- it leaves a portal into a visible area on the *other* side than the portal's hidden side, after moving enough (`min_travel_*`);
+- it moves between an inside and an outside zone after moving enough;
+- it **vanishes inside a portal** (lost for `commit_lost_frames`) after really walking toward it (`vanish_lookback_frames`, `min_travel_*`) and its side differs from the portal's hidden side.
+A person who walks to the door edge and returns, or stands in the portal and is lost, produces nothing.
+Region changes need `min_dwell_frames` frames, which removes boundary flicker.
 
-- Draw it **across the gate, pointing toward the inside of the room**.
-- Only its *direction* matters, not its length or position.
-- It does **not** have to be horizontal or vertical. Draw it however people actually walk.
-- If your IN/OUT are swapped, just draw the arrow the opposite way.
+Each track has its own state, so the same ID is never counted twice for the same crossing.
+If the tracker gives a person a new ID right at the gate, that crossing can be missed or split. This is a tracker limit.
 
-```
-   outside                inside
-      ○ ──►  [  GATE  ]  ──►  ○        arrow points to the inside → this way = IN
-```
+## 6. Config reference (`config.json`)
 
-### Coordinates are normalized (0..1)
-In `config.json`, points are fractions of the frame: `[0,0]` = top-left, `[1,1]` = bottom-right.
-So the same config works if you change the camera resolution. You normally never edit them by hand:
-use `g` then `s`.
+Geometry is **normalized 0..1** (fraction of frame width/height), so resolution changes don't break it. Normally you never edit it by hand.
 
----
+Top level: `source` (index / path / RTSP), `model`, `tracker`, `conf`, `iou`, `imgsz`, `device` (`null`, `"cpu"`, `"0"`),
+`display_scale`, `realtime_playback` (files only).
 
-## 5. How the counting logic works
+`counter`:
 
-Every person (track ID) has its **own** small state machine:
+| key | default | meaning |
+|---|---|---|
+| `ref_point` | `bottom_center` | point of the bbox that is tracked: feet, or `center` if feet are often hidden |
+| `smooth_window` | 5 | moving average (frames) |
+| `track_timeout_frames` | 30 | forget a track unseen this long |
+| `max_history` | 300 | trail length |
+| `lines[]` | `[]` | `{id, p0, p1, in_side, margin_px, margin_bbox_ratio, extend}`; defaults 8 / 0.08 / 0.15; `in_side` = `left`/`right` of p0→p1 as seen on screen |
+| `region.zones[]` | `[]` | `{id, kind: portal/inside/outside, polygon, leads_to}`; `leads_to` (`outside`/`inside`) only for portals |
+| `region.default_side` | `auto` | meaning of unmarked area. `auto`: opposite of what the portal leads to; or opposite of the only zone kind drawn |
+| `region.min_dwell_frames` | 3 | frames in a region before it is trusted |
+| `region.commit_lost_frames` | 8 | lost this long inside a portal = vanished into it |
+| `region.vanish_lookback_frames` | 30 | window used to check the person was really moving |
+| `region.min_travel_px` / `min_travel_bbox_ratio` | 30 / 0.35 | min movement to accept a region change: `max(px, ratio * bbox height)` |
 
-```
- IDLE ──feet enter gate──► IN_GATE ──moved far enough along the arrow──► COUNTED
-   ▲                          │                                             │
-   └──── left gate, no ◄──────┘                                             │
-         decision (turned back)                    outside the gate for N frames
-   ▲                                                                        │
-   └────────────────────────────────────────────────────────────────────────┘
-```
+## 7. Using the module in your own code
 
-1. **IDLE → IN_GATE**: the smoothed feet point enters the polygon. The previous point is remembered as the *entry point*.
-2. **While IN_GATE**: the displacement `current − entry` is projected onto the arrow.
-   - projection > 0 → **IN**, projection < 0 → **OUT**.
-   - It is only accepted if (a) the distance is big enough (`min_displacement_*`) and
-     (b) the movement is mostly along the arrow (`min_alignment`), so someone walking *sideways* across the gate is ignored.
-3. **Leaves the gate** without enough movement → no event (e.g. someone who walked in a bit and turned back).
-4. **Track lost while inside** (occlusion, left the view) → one final decision using the last known position.
-5. **COUNTED**: the track is locked. It can only count again after it has been **outside** the gate for `rearm_frames_outside` frames. This is what prevents counting the same person many times.
-
-The movement is smoothed (moving average) to remove bounding-box jitter, and the distance threshold scales with the person's box height, so it adapts to perspective (people far away look smaller).
-
----
-
-## 6. Using the module in your own code
-
-`gate_counter.py` is independent. Copy that one file into any project.
+`gate_counter.py` needs nothing but the standard library. Copy it anywhere. It works in **pixels**.
 
 ```python
-from gate_counter import GateConfig, GateCounter
+from gate_counter import CounterConfig, LineGate, Zone, RegionConfig, GateCounter
 
-cfg = GateConfig(
-    polygon=[(300, 200), (700, 200), (700, 500), (300, 500)],   # PIXELS here
-    in_direction=((500, 250), (500, 450)),                      # PIXELS here
+cfg = CounterConfig(
+    lines=[LineGate("door", (100, 400), (500, 400), in_side="left")],
+    region=RegionConfig(zones=[Zone("gate2", "portal", [(250,100),(390,100),(390,250),(250,250)], leads_to="outside")]),
 )
 counter = GateCounter(cfg)
-
-frame_idx = 0
-for frame in your_frames:
-    frame_idx += 1
-    tracks = [(12, (x1, y1, x2, y2)), (15, (x1, y1, x2, y2))]   # from ANY detector+tracker
-    for ev in counter.update(frame_idx, tracks):
-        print(ev.type, ev.track_id, ev.frame, ev.point)          # "IN" / "OUT"
-
-print(counter.count_in, counter.count_out)
+for frame_idx, tracks in enumerate(your_stream, 1):          # tracks = [(id, (x1,y1,x2,y2)), ...]
+    for ev in counter.update(frame_idx, tracks):             # call once per frame
+        print(ev.type, ev.track_id, ev.gate_id)              # "IN"/"OUT"
+print(counter.count_in, counter.count_out, counter.counts)   # counts per gate id
 ```
+Any detector+tracker works. `CounterConfig.from_dict()/to_dict()` load/save the JSON shape above (in pixels).
 
-Rules:
-- The module itself uses **pixels**. The 0..1 normalization is only done by `main.py` when reading/saving the config.
-- Call `update()` **once per frame**, with `frame_idx` increasing. Pass only the people visible in that frame.
-- You can use any detector/tracker (YOLO, RT-DETR, DeepSORT...) as long as you give `(track_id, (x1,y1,x2,y2))`.
-- Useful extras: `counter.tracks` (per-track state + `trail`), `counter.reset()`, `counter.set_config(new_cfg)`.
-- No GUI needed: you can run it headless on a server and only read the events.
+## 8. Several cameras / rooms
 
----
+One camera = one config file = one process. Gates depend on where the camera is looking, so draw them per camera.
 
-## 7. Using it with different cameras / different rooms
-
-**One camera = one config file = one running process.** Gate and arrow depend on where the camera is, so each camera needs its own.
-
+```bash
+python main.py --config configs/entrance.json
+python main.py --config configs/office.json
 ```
-configs/
-  entrance.json      # source: rtsp://.../cam1   + gate drawn for that view
-  office_door.json   # source: rtsp://.../cam2   + gate drawn for that view
-  warehouse.json     # source: video or camera 2
-```
+For each new camera: copy `config.json`, set `source`, run, draw gates (section 4), press `s`, watch events, tune (section 9).
+If the camera moves, redraw. Counts and IDs are per camera.
 
-Setup for each new camera:
-
-1. Copy `config.json` to a new file, e.g. `office_door.json`, and set `"source"` (camera index, video path or RTSP URL).
-2. Run `python main.py --config office_door.json`.
-3. Press `g`, draw the gate over the doorway and the arrow toward the inside. Press `s`.
-4. Walk through a few times (or play a recording) and watch the events. Tune the parameters (section 8).
-5. Run one terminal/process per camera:
-   ```bash
-   python main.py --config configs/entrance.json
-   python main.py --config configs/office_door.json
-   ```
-
-Notes:
-- If the camera is **moved or rotated**, redraw the gate (`g`, `s`).
-- Each camera has its own `GateCounter`, so IDs and counts are **separate per camera**. The same person seen by two cameras is counted by each independently.
-- For several cameras in one Python program, create one `GateCounter` per camera and feed each its own tracks.
-- Good camera placement: looking at the passage so people walk **across the arrow direction clearly** (towards/away from the camera or side-on both work), with the feet visible inside the gate.
-
----
-
-## 8. Tuning (in the `gate` section of the config)
+## 9. Tuning
 
 | Problem | Try |
 |---|---|
-| Real entries are missed | Lower `min_displacement_px` / `min_displacement_bbox_ratio`; enlarge the polygon; lower `min_alignment` |
-| False counts (people just standing/passing by) | Raise `min_displacement_*`; shrink the polygon; raise `min_alignment` |
-| Walking sideways across the gate gets counted | Raise `min_alignment` (e.g. 0.6) |
-| Same person counted twice | Raise `rearm_frames_outside`; improve tracking (bigger model, lower `conf` to keep tracks alive) |
-| IN and OUT are swapped | Redraw the arrow the other way |
-| Counts jump around due to jitter | Raise `smooth_window` |
-| People missed when occluded | Raise `track_timeout_frames` |
-| Feet hidden (only upper body visible) | Set `ref_point` to `center` |
+| Misses on a line | lower `margin_*` (but not below the feet jitter); make sure feet are visible, else `ref_point: center`; lengthen the line or raise `extend` |
+| Extra counts on a line | raise `margin_bbox_ratio`; people walking past the line end: lower `extend` |
+| Portal misses vanishes | lower `commit_lost_frames`, `min_travel_*`; enlarge the portal slightly |
+| Portal false counts | shrink the portal tightly around the door; raise `commit_lost_frames` / `min_travel_*` |
+| IN/OUT swapped | line: re-draw with the inside click on the other side; portal: `O`/`I` the other way; zones: press `f` |
+| Region flicker | raise `min_dwell_frames` |
+| IDs change a lot | bigger model (`yolov8s/m`), lower `conf`, better lighting |
 
-Detector-level (top of config): `model` (`yolov8n.pt` fast, `yolov8s/m.pt` more accurate), `conf`, `imgsz`, `device` (`"cpu"`, `"0"` for GPU).
-The full parameter list is in `CONFIG.md`.
+## 10. Limits (read this)
 
----
+- Tested only with synthetic tracks (`test_gate_counter.py`: lines at any angle, jitter, walking around a line, portals from both camera sides, outside zone, out-then-in with the same ID). **Not yet validated on real footage**, so expect to tune on yours.
+- Portal logic relies on the tracker keeping the ID until the person vanishes and on the detector not finding people inside the door area.
+- Lines/zones use the feet point on the floor; camera lens distortion, strong occlusion or very tall camera tilt can need a looser margin.
+- Groups entering together get an ID each only if the detector/tracker separates them.
 
-## 9. Troubleshooting
+## 11. Porting `gate_counter.py` to C++
 
-- **Nothing is counted**: check that the green/red dot on a person turns green inside the polygon, the arrow points the way people walk, and the label reaches `COUNTED`. If it stays `IN_GATE` then goes back to `IDLE`, the movement was too small or not aligned: lower the thresholds.
-- **IDs keep changing**: the tracker loses people. Use a better model, check lighting, or lower `conf`.
-- **Window too large**: set `display_scale` (e.g. `0.6`).
-- **Video plays too fast/slow**: `realtime_playback` (files only). Slow machines can't keep real-time; set `imgsz` smaller or use a lighter model.
-
----
-
-## 10. Porting `gate_counter.py` to C++
-
-The module was written for this: only loops, structs, `deque`, and `dict` of per-track states.
-Mapping: `GateConfig` → struct, `TrackState` → struct, `Dict` → `std::unordered_map<int, TrackState>`, `deque` → `std::deque`,
-`point_in_polygon` and the median/projection math are plain arithmetic. No external libraries are needed.
+Only structs, loops, `std::deque`, `std::unordered_map`, and plain arithmetic: `CounterConfig`/`TrackState` → structs,
+`point_in_polygon`, signed-distance, median and distance helpers translate directly. No external libraries.
