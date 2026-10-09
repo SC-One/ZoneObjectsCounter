@@ -1,0 +1,24 @@
+{
+  "source": "0",
+  "model": "yolov8n.pt",
+  "tracker": "bytetrack.yaml",
+  "conf": 0.35,
+  "iou": 0.5,
+  "imgsz": 640,
+  "device": null,
+  "display_scale": 1.0,
+  "realtime_playback": true,
+  "gate": {
+    "polygon": [[300, 200], [700, 200], [700, 500], [300, 500]],
+    "in_direction": [[500, 250], [500, 450]],
+    "ref_point": "bottom_center",
+    "smooth_window": 5,
+    "min_displacement_px": 30,
+    "min_displacement_bbox_ratio": 0.5,
+    "min_alignment": 0.4,
+    "min_frames_in_gate": 3,
+    "rearm_frames_outside": 10,
+    "track_timeout_frames": 30,
+    "max_history": 300
+  }
+}
