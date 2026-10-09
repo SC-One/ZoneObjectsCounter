@@ -3,8 +3,10 @@ Gate IN/OUT debug GUI.  YOLO + ByteTrack (ultralytics) -> GateCounter (independe
 
 Keys: q/Esc quit | space pause | g edit gate | s save config | r reset counts
       t toggle trails | d toggle debug labels
-Gate editor: left-click polygon points, Backspace undo, Enter to finish polygon,
-             then click 2 points = IN direction arrow (start -> end). Esc cancels.
+Gate editor (press g at any time, video freezes on the current frame):
+             left-click polygon points, Backspace undo, Enter to finish polygon,
+             then click 2 points = IN direction arrow (start -> end) or Enter to keep the
+             current arrow. Esc cancels. Press s to save (stored normalized 0..1).
 """
 import argparse
 import json
@@ -15,6 +17,21 @@ import cv2
 import numpy as np
 
 from gate_counter import GateConfig, GateCounter
+
+
+# ------------------------------------------------------------ normalized <-> pixel gate
+def gate_to_pixels(g, w, h):
+    g = dict(g)
+    g["polygon"] = [[x * w, y * h] for x, y in g["polygon"]]
+    g["in_direction"] = [[x * w, y * h] for x, y in g["in_direction"]]
+    return g
+
+
+def gate_to_normalized(g, w, h):
+    g = dict(g)
+    g["polygon"] = [[round(x / w, 5), round(y / h, 5)] for x, y in g["polygon"]]
+    g["in_direction"] = [[round(x / w, 5), round(y / h, 5)] for x, y in g["in_direction"]]
+    return g
 
 
 # ------------------------------------------------------------ detection
@@ -68,8 +85,12 @@ class GateEditor:
             self.active = False
         elif k in (8, 127) and self.poly and not self._poly_done:
             self.poly.pop()
-        elif k in (13, 10) and len(self.poly) >= 3:
-            self._poly_done = True
+        elif k in (13, 10):
+            if not self._poly_done and len(self.poly) >= 3:
+                self._poly_done = True
+            elif self._poly_done and not self.arrow:      # keep current IN direction
+                self.result = (self.poly, None)
+                self.active = False
 
     def start_fresh(self):
         self.start()
@@ -84,7 +105,7 @@ class GateEditor:
             cv2.polylines(img, [np.array(pts)], self._poly_done, (0, 255, 255), 2)
         for p in self.arrow:
             cv2.circle(img, (int(p[0] * s), int(p[1] * s)), 5, (255, 0, 255), -1)
-        msg = ("Click IN-direction START then END" if self._poly_done
+        msg = ("Click IN-direction START then END (or Enter = keep current)" if self._poly_done
                else "Click polygon points, Enter=done, Backspace=undo, Esc=cancel")
         cv2.putText(img, "EDIT GATE: " + msg, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
@@ -167,8 +188,17 @@ def main():
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
+    w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if not w or not h:                                     # fallback: probe one frame
+        ok, probe = cap.read()
+        if not ok:
+            raise SystemExit("Cannot read from source")
+        h, w = probe.shape[:2]
+        if is_file:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
     tracker = PersonTracker(cfg)
-    counter = GateCounter(GateConfig.from_dict(cfg["gate"]))
+    counter = GateCounter(GateConfig.from_dict(gate_to_pixels(cfg["gate"], w, h)))
     scale = float(cfg.get("display_scale", 1.0))
     editor = GateEditor(scale)
 
@@ -195,6 +225,7 @@ def main():
 
         if editor.result:                      # new gate drawn
             poly, arrow = editor.result
+            arrow = arrow or counter.cfg.in_direction
             counter.set_config(GateConfig.from_dict({**counter.cfg.to_dict(),
                                                      "polygon": poly, "in_direction": arrow}))
             counter.reset()
@@ -219,10 +250,10 @@ def main():
         elif k == ord("g") and frame is not None:
             editor.start_fresh()
         elif k == ord("s"):
-            cfg["gate"] = counter.cfg.to_dict()
+            cfg["gate"] = gate_to_normalized(counter.cfg.to_dict(), w, h)
             with open(args.config, "w") as f:
                 json.dump(cfg, f, indent=2)
-            print("Saved gate to", args.config)
+            print("Saved normalized gate to", args.config)
         elif k == ord("r"):
             counter.reset(); flashes.clear(); log.clear()
         elif k == ord("t"):

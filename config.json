@@ -9,9 +9,35 @@
   "display_scale": 1.0,
   "realtime_playback": true,
   "gate": {
-    "polygon": [[300, 200], [700, 200], [700, 500], [300, 500]],
-    "in_direction": [[500, 250], [500, 450]],
-    "ref_point": "bottom_center",
+    "polygon": [
+      [
+        0.41406,
+        0.13125
+      ],
+      [
+        0.53281,
+        0.13542
+      ],
+      [
+        0.55469,
+        0.96458
+      ],
+      [
+        0.41719,
+        0.97083
+      ]
+    ],
+    "in_direction": [
+      [
+        0.4375,
+        0.5375
+      ],
+      [
+        0.51562,
+        0.53958
+      ]
+    ],
+    "ref_point": "center",
     "smooth_window": 5,
     "min_displacement_px": 30,
     "min_displacement_bbox_ratio": 0.5,
