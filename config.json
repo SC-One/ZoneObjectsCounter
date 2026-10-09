@@ -10,45 +10,19 @@
   "realtime_playback": true,
   "fullscreen": false,
   "counter": {
-    "lines": [],
-    "region": {
-      "zones": [
-        {
-          "id": "portal1",
-          "kind": "portal",
-          "polygon": [
-            [
-              0.61719,
-              0.13333
-            ],
-            [
-              0.27656,
-              0.13958
-            ],
-            [
-              0.29688,
-              0.93125
-            ],
-            [
-              0.6375,
-              0.90208
-            ]
-          ],
-          "leads_to": "outside",
-          "far_percent": 0.0,
-          "far_metric": "area"
-        }
-      ],
-      "default_side": "auto",
-      "min_dwell_frames": 3,
-      "commit_lost_frames": 8,
-      "portal_use_box_center": true,
-      "min_travel_px": 30,
-      "min_travel_bbox_ratio": 0.35
-    },
     "ref_point": "bottom_center",
     "smooth_window": 5,
     "track_timeout_frames": 30,
-    "max_history": 300
+    "max_history": 300,
+    "lines": [],
+    "region": {
+      "default_side": "auto",
+      "min_dwell_frames": 3,
+      "commit_lost_frames": 8,
+      "min_travel_px": 30,
+      "min_travel_bbox_ratio": 0.35,
+      "zones": [],
+      "portal_use_box_center": true
+    }
   }
 }
